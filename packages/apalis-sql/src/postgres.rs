@@ -392,11 +392,36 @@ pub mod expose {
     use apalis_core::worker::WorkerId;
     use chrono::{DateTime, Utc};
     use std::collections::HashMap;
+    use std::ops::{Deref, DerefMut};
+
+    pub struct JobManager<'a, J> {
+        name: &'a str,
+        storage: PostgresStorage<J>,
+    }
+
+    impl<'a, J> JobManager<'a, J> {
+        pub fn new(name: &'a str, storage: PostgresStorage<J>) -> Self {
+            Self{name, storage}
+        }
+    }
+
+    impl<J> Deref for JobManager<'_, J> {
+        type Target = PostgresStorage<J>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.storage
+        }
+    }
+    impl<J> DerefMut for JobManager<'_, J> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.storage
+        }
+    }
 
     #[async_trait::async_trait]
 
-    impl<J: 'static + Job + Serialize + DeserializeOwned + Send + Sync + Unpin> JobStreamExt<J>
-        for PostgresStorage<J>
+    impl<J: 'static + Serialize + DeserializeOwned + Send + Sync + Unpin> JobStreamExt<J>
+        for JobManager<'_,J>
     {
         async fn counts(&mut self) -> Result<JobStateCount, JobError> {
             let mut conn = self
@@ -415,7 +440,7 @@ pub mod expose {
                             COUNT(1) FILTER (WHERE status = 'Killed') AS killed
                         FROM apalis.jobs WHERE job_type = $1";
             let res: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(fetch_query)
-                .bind(J::NAME)
+                .bind(self.name)
                 .fetch_one(&mut *conn)
                 .await
                 .map_err(|e| StorageError::Database(Box::from(e)))?;
@@ -445,7 +470,7 @@ pub mod expose {
             let fetch_query = "SELECT * FROM apalis.jobs WHERE status = $1 AND job_type = $2 ORDER BY done_at DESC, run_at DESC LIMIT 10 OFFSET $3";
             let res: Vec<SqlJobRequest<J>> = sqlx::query_as(fetch_query)
                 .bind(status)
-                .bind(J::NAME)
+                .bind(self.name)
                 .bind((page - 1) * 10)
                 .fetch_all(&mut *conn)
                 .await
@@ -463,7 +488,7 @@ pub mod expose {
             let fetch_query =
             "SELECT id, layers, last_seen FROM apalis.workers WHERE worker_type = $1 ORDER BY last_seen DESC LIMIT 20 OFFSET $2";
             let res: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(fetch_query)
-                .bind(J::NAME)
+                .bind(self.name)
                 .bind(0_i64)
                 .fetch_all(&mut *conn)
                 .await
@@ -487,6 +512,8 @@ mod tests {
     use apalis_core::request::JobState;
     use email_service::Email;
     use futures::StreamExt;
+    use apalis_core::expose::JobStreamExt;
+    use crate::postgres::expose::JobManager;
 
     /// migrate DB and return a storage instance.
     async fn setup() -> PostgresStorage<Email> {
@@ -698,5 +725,14 @@ mod tests {
         assert_eq!(*job.context().lock_by(), Some(worker_id.clone()));
 
         cleanup(storage, &worker_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_job_manager() {
+        let mut manager = JobManager::new("dummy", setup().await);
+
+        let _ = manager.list_workers().await.unwrap();
+        let _ = manager.counts().await.unwrap();
+        let _ = manager.list_jobs(&JobState::Pending, 1).await.unwrap();
     }
 }
